@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://github.com/JBKing514/autoEhHunter/blob/main/Media/ico/AutoEhHunterLogo_256.png" width="256" alt="AutoEhHunter_Ico">
+  <img src="Media/ico/AutoEhHunterLogo_256.png" width="256" alt="AutoEhHunter_Ico">
   <br>
 </p>
 
