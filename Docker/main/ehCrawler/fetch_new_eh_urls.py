@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""Incrementally fetch newly uploaded EH gallery URLs into a queue file.
+
+Workflow:
+- Crawl EH listing pages from newest to older
+- Stop when reaching the last-seen gallery checkpoint from state file
+- Append only new URLs into queue file (deduplicated)
+- Update checkpoint to the newest gallery seen in this run
+
+This script writes pending URLs into PostgreSQL table `eh_queue`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import html
+import json
+import math
+import re
+import sys
+import time
+from pathlib import Path
+from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlparse, urlunparse
+
+import requests
+
+
+GALLERY_RE = re.compile(r"/g/(\d+)/([0-9A-Za-z]+)/")
+ABS_GALLERY_RE = re.compile(r"https?://((?:e-hentai|exhentai)\.org)/g/(\d+)/([0-9A-Za-z]+)/")
+HREF_RE = re.compile(r"href=[\"']([^\"']+)[\"']", re.IGNORECASE)
+
+
+def _extract_host(base_url: str) -> str:
+    m = re.search(r"https?://((?:e-hentai|exhentai)\.org)", str(base_url or "").strip(), re.IGNORECASE)
+    if m:
+        return m.group(1).lower()
+    return "e-hentai.org"
+
+
+def _parse_gallery_url(url: str, default_base_url: str = "https://e-hentai.org") -> tuple[int, str, str]:
+    s = (url or "").strip()
+    m = ABS_GALLERY_RE.search(s)
+    if m:
+        host = m.group(1).lower()
+        gid = int(m.group(2))
+        token = m.group(3)
+        return gid, token, f"https://{host}/g/{gid}/{token}/"
+
+    m2 = GALLERY_RE.search(s)
+    if not m2:
+        raise RuntimeError(f"Invalid gallery URL: {url}")
+    host = _extract_host(default_base_url)
+    gid = int(m2.group(1))
+    token = m2.group(2)
+    return gid, token, f"https://{host}/g/{gid}/{token}/"
+
+
+def _extract_gallery_urls(page_html: str, base_url: str) -> list[str]:
+    out: list[str] = []
+    seen: set[tuple[int, str]] = set()
+    host = _extract_host(base_url)
+
+    # Absolute links first.
+    for m in ABS_GALLERY_RE.finditer(page_html):
+        abs_host = m.group(1).lower()
+        gid = int(m.group(2))
+        token = m.group(3)
+        key = (gid, token)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f"https://{abs_host}/g/{gid}/{token}/")
+
+    # Then relative links (if any remain unseen).
+    for m in GALLERY_RE.finditer(page_html):
+        gid = int(m.group(1))
+        token = m.group(2)
+        key = (gid, token)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(f"https://{host}/g/{gid}/{token}/")
+
+    return out
+
+
+def _sanitize_start_url(base_url: str) -> str:
+    s = (base_url or "").strip()
+    if not s:
+        s = "https://e-hentai.org/"
+    if not re.match(r"^https?://", s, flags=re.IGNORECASE):
+        s = "https://" + s
+
+    p = urlparse(s)
+    query_items = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if k.lower() != "page"]
+    query = urlencode(query_items, doseq=True)
+    path = p.path or "/"
+    return urlunparse((p.scheme, p.netloc, path, p.params, query, p.fragment))
+
+
+def _extract_next_listing_url(page_html: str, current_url: str, base_url: str) -> str | None:
+    base_host = _extract_host(base_url)
+
+    for m in HREF_RE.finditer(page_html):
+        href = html.unescape(m.group(1).strip())
+        if "next=" not in href:
+            continue
+
+        abs_url = urljoin(current_url, href)
+        p = urlparse(abs_url)
+        host = p.netloc.lower()
+        if host and host != base_host:
+            continue
+
+        qs = parse_qs(p.query)
+        nxt_vals = qs.get("next")
+        if not nxt_vals:
+            continue
+        nxt = (nxt_vals[0] or "").strip()
+        if not nxt:
+            continue
+        return abs_url
+
+    return None
+
+
+def _load_state(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    return {}
+
+
+def _save_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _enqueue_urls_to_db(dsn: str, urls: list[str]) -> int:
+    if not urls:
+        return 0
+    try:
+        import importlib
+
+        psycopg = importlib.import_module("psycopg")
+    except Exception as e:
+        raise RuntimeError('Missing dependency psycopg. Install with: pip install "psycopg[binary]"') from e
+
+    rows: list[tuple[int, str, str]] = []
+    for u in urls:
+        gid, token, normalized = _parse_gallery_url(u)
+        rows.append((gid, token, normalized))
+
+    sql = (
+        "INSERT INTO eh_queue (gid, token, eh_url, status, updated_at) "
+        "VALUES (%s, %s, %s, 'pending', now()) "
+        "ON CONFLICT (gid, token) DO NOTHING"
+    )
+
+    inserted = 0
+    with psycopg.connect(dsn) as conn:
+        with conn.cursor() as cur:
+            for row in rows:
+                cur.execute(sql, row)
+                if (cur.rowcount or 0) > 0:
+                    inserted += 1
+        conn.commit()
+    return inserted
+
+
+def _sparse_sample(urls: list[str], density: float) -> list[str]:
+    if not urls:
+        return []
+    d = max(0.0, min(1.0, float(density)))
+    if d <= 0.0:
+        return []
+    if d >= 1.0:
+        return list(urls)
+
+    n = len(urls)
+    keep_n = max(1, int(math.ceil(n * d)))
+    if keep_n >= n:
+        return list(urls)
+
+    # Evenly sample across newest->older sequence to preserve temporal coverage.
+    picked_idx: set[int] = set()
+    for i in range(keep_n):
+        idx = int(round(i * (n - 1) / (keep_n - 1))) if keep_n > 1 else 0
+        picked_idx.add(max(0, min(n - 1, idx)))
+    return [u for i, u in enumerate(urls) if i in picked_idx]
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(description="Fetch new EH gallery URLs incrementally")
+    ap.add_argument("--base-url", default="https://e-hentai.org", help="EH listing base URL")
+    ap.add_argument(
+        "--start-page",
+        type=int,
+        default=0,
+        help="How many listing pages to skip from newest before collecting URLs",
+    )
+    ap.add_argument("--max-pages", type=int, default=8, help="How many listing pages to collect per run")
+    ap.add_argument("--timeout", type=int, default=30, help="HTTP timeout seconds")
+    ap.add_argument("--dsn", required=True, help="PostgreSQL DSN (used to write eh_queue)")
+    ap.add_argument("--sleep-seconds", type=float, default=4.0, help="Sleep seconds between EH requests")
+    ap.add_argument(
+        "--max-run-minutes",
+        type=float,
+        default=0.0,
+        help="Max runtime minutes for this fetch run (0 means no runtime limit)",
+    )
+    ap.add_argument(
+        "--sampling-density",
+        type=float,
+        default=1.0,
+        help="0.0-1.0 sparse sampling density for queued URLs (1.0 means keep all, 0.0 means keep none)",
+    )
+    ap.add_argument("--cookie", default="", help="Optional Cookie header")
+    ap.add_argument("--user-agent", default="Mozilla/5.0", help="HTTP User-Agent")
+    ap.add_argument("--http-proxy", default="", help="HTTP proxy for EH requests")
+    ap.add_argument("--https-proxy", default="", help="HTTPS proxy for EH requests")
+    ap.add_argument(
+        "--state-file",
+        default=str(Path(__file__).resolve().parent / "cache" / "eh_incremental_state.json"),
+        help="Checkpoint state file path",
+    )
+    ap.add_argument(
+        "--queue-file",
+        default=str(Path(__file__).resolve().parent / "eh_gallery_queue.txt"),
+        help="[deprecated] legacy queue file path (unused when DB queue is enabled)",
+    )
+    ap.add_argument("--reset-state", action="store_true", help="Ignore previous checkpoint and fetch all pages this run")
+    args = ap.parse_args(argv)
+
+    density = max(0.0, min(1.0, float(args.sampling_density)))
+
+    state_path = Path(args.state_file)
+    state = {} if args.reset_state else _load_state(state_path)
+    checkpoint_gid = state.get("last_seen_gid")
+    checkpoint_token = state.get("last_seen_token")
+    if not isinstance(checkpoint_gid, int):
+        checkpoint_gid = None
+    if not isinstance(checkpoint_token, str):
+        checkpoint_token = None
+
+    session = requests.Session()
+    session.trust_env = False
+    session.headers.update({"User-Agent": args.user_agent})
+    if args.cookie.strip():
+        session.headers.update({"Cookie": args.cookie.strip()})
+    proxies: dict[str, str] = {}
+    if str(args.http_proxy or "").strip():
+        proxies["http"] = str(args.http_proxy).strip()
+    if str(args.https_proxy or "").strip():
+        proxies["https"] = str(args.https_proxy).strip()
+    if proxies:
+        session.proxies.update(proxies)
+
+    discovered_new: list[str] = []
+    discovered_new_keys: set[tuple[int, str]] = set()
+    newest_seen: tuple[int, str] | None = None
+    stop_reached = False
+    sleep_s = max(0.0, float(args.sleep_seconds))
+    max_run_s = max(0.0, float(args.max_run_minutes)) * 60.0
+    started = time.monotonic()
+    stop_reason = "max_pages"
+
+    # Explicit "pause mode": do not crawl and do not move checkpoint.
+    if density <= 0.0:
+        now = dt.datetime.now(tz=dt.timezone.utc).isoformat()
+        state["updated_at"] = now
+        state["sampling_density"] = density
+        state["last_run_new_count"] = 0
+        state["last_run_sampled_count"] = 0
+        state["last_run_pages_crawled"] = 0
+        state["stop_reached_checkpoint"] = False
+        state["checkpoint_advanced"] = False
+        _save_state(state_path, state)
+        print("Done. sampling_density=0, skipped crawling and queue append.", file=sys.stderr)
+        return 0
+
+    start_page = max(0, int(args.start_page))
+    max_pages = int(args.max_pages)
+    if max_pages <= 0:
+        max_pages = 1_000_000
+    page_index = 0
+    pages_crawled = 0
+    requests_made = 0
+    current_url = _sanitize_start_url(args.base_url)
+    seen_listing_urls: set[str] = set()
+
+    while current_url and pages_crawled < max_pages:
+        elapsed = time.monotonic() - started
+        if max_run_s > 0 and elapsed >= max_run_s:
+            stop_reason = "max_run_minutes"
+            break
+
+        if requests_made > 0 and sleep_s > 0:
+            if max_run_s > 0 and (time.monotonic() - started + sleep_s) >= max_run_s:
+                stop_reason = "max_run_minutes"
+                break
+            time.sleep(sleep_s)
+
+        r = session.get(current_url, timeout=args.timeout)
+        r.raise_for_status()
+        requests_made += 1
+
+        next_url = _extract_next_listing_url(r.text, current_url=current_url, base_url=args.base_url)
+
+        # Honor start-page as an offset from newest listings.
+        if page_index < start_page:
+            page_index += 1
+            if not next_url:
+                stop_reason = "no_next"
+                break
+            if next_url in seen_listing_urls:
+                stop_reason = "pagination_loop"
+                break
+            seen_listing_urls.add(current_url)
+            current_url = next_url
+            continue
+
+        pages_crawled += 1
+
+        gallery_urls = _extract_gallery_urls(r.text, args.base_url)
+        if not gallery_urls:
+            if not next_url:
+                stop_reason = "no_next"
+                break
+            if next_url in seen_listing_urls:
+                stop_reason = "pagination_loop"
+                break
+            seen_listing_urls.add(current_url)
+            current_url = next_url
+            page_index += 1
+            continue
+
+        for u in gallery_urls:
+            gid, token, normalized = _parse_gallery_url(u)
+            key = (gid, token)
+
+            if newest_seen is None:
+                newest_seen = key
+
+            if checkpoint_gid is not None and checkpoint_token is not None and key == (checkpoint_gid, checkpoint_token):
+                stop_reached = True
+                stop_reason = "checkpoint"
+                break
+
+            if key in discovered_new_keys:
+                continue
+
+            discovered_new_keys.add(key)
+            discovered_new.append(normalized)
+
+        if stop_reached:
+            break
+
+        if not next_url:
+            stop_reason = "no_next"
+            break
+        if next_url in seen_listing_urls:
+            stop_reason = "pagination_loop"
+            break
+
+        seen_listing_urls.add(current_url)
+        current_url = next_url
+        page_index += 1
+
+    sampled_new = _sparse_sample(discovered_new, density)
+    inserted = 0
+    if sampled_new:
+        inserted = _enqueue_urls_to_db(args.dsn, sampled_new)
+
+    now = dt.datetime.now(tz=dt.timezone.utc).isoformat()
+    checkpoint_advanced = False
+    can_advance = checkpoint_gid is None or checkpoint_token is None or stop_reached
+    if newest_seen is not None and can_advance:
+        state["last_seen_gid"] = newest_seen[0]
+        state["last_seen_token"] = newest_seen[1]
+        checkpoint_advanced = True
+    state["updated_at"] = now
+    state["sampling_density"] = density
+    state["last_run_new_count"] = len(discovered_new)
+    state["last_run_sampled_count"] = len(sampled_new)
+    state["last_run_pages_crawled"] = pages_crawled
+    state["stop_reached_checkpoint"] = stop_reached
+    state["stop_reason"] = stop_reason
+    state["max_run_minutes"] = float(args.max_run_minutes)
+    state["checkpoint_advanced"] = checkpoint_advanced
+    state["checkpoint_not_reached"] = bool(checkpoint_gid is not None and checkpoint_token is not None and not stop_reached)
+    _save_state(state_path, state)
+
+    print(
+        f"Done. new_urls={len(discovered_new)} sampled_urls={len(sampled_new)} density={density:.3f} "
+        f"pages_crawled={pages_crawled} checkpoint_reached={stop_reached} "
+        f"checkpoint_advanced={checkpoint_advanced} stop_reason={stop_reason} enqueued={inserted}",
+        file=sys.stderr,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
