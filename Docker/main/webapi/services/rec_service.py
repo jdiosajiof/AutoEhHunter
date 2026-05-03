@@ -113,11 +113,11 @@ def _compute_xp_map(
             return False
         return True
 
-    docs = [" ".join([tg for tg in _normalize_tags(r.get("tags")) if _keep_tag(tg)]) for r in rows]
-    if len(docs) < 4 or sum(len(d.strip()) > 0 for d in docs) < 4:
+    docs = [[tg for tg in _normalize_tags(r.get("tags")) if _keep_tag(tg)] for r in rows]
+    if len(docs) < 4 or sum(len(d) > 0 for d in docs) < 4:
         return {"points": [], "clusters": [], "meta": {"reason": "no_tags"}}
 
-    vec = TfidfVectorizer(max_features=3000, token_pattern=r"[^\s]+")
+    vec = TfidfVectorizer(analyzer=lambda x: x, max_features=3000, token_pattern=None)
     X = vec.fit_transform(docs)
     feature_names = vec.get_feature_names_out().tolist()
     n_samples = X.shape[0]
