@@ -392,9 +392,10 @@ class OpenAICompatClient:
 def _normalize_to_jpeg_bytes(b: bytes) -> bytes:
     """Decode image bytes and re-encode as JPEG.
 
-    This avoids server-side decoder limitations (e.g. WEBP) and keeps inputs uniform.
+    This avoids server-side decoder limitations (e.g. WEBP/JPEG-XL) and keeps inputs uniform.
     """
 
+    import pillow_jxl
     from PIL import Image
 
     img = Image.open(io.BytesIO(b))
