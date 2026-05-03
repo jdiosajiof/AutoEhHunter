@@ -6,6 +6,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
+from ..core.config_values import resolve_text_vec_config
 from .db_service import db_dsn, query_rows
 
 _PREF_RE = re.compile(r"(喜欢|不喜欢|讨厌|偏好|口味|别推|不要|不错|再来|黑名单)")
@@ -240,11 +241,16 @@ def collect_memory_data(user_id: str, query_text: str | None = None, cfg: dict[s
     if query_text and cfg:
         query_vec = _get_embedding_for_text(query_text.strip(), cfg)
     if query_vec:
+        tvc = resolve_text_vec_config(cfg or {})
+        tv_stored = int(tvc.get("stored_dim") or len(query_vec))
+        tv_cast = str(tvc.get("cast_sql") or "::vector")
+        if bool(tvc.get("matryoshka")) and len(query_vec) > tv_stored:
+            query_vec = query_vec[:tv_stored]
         emb_str = "[" + ",".join(str(float(x)) for x in query_vec) + "]"
         fact_rows = query_rows(
             "SELECT fact FROM semantic_memory "
             "WHERE user_id=%s AND embedding IS NOT NULL "
-            "ORDER BY embedding <=> %s::vector LIMIT 8",
+            f"ORDER BY embedding <=> %s{tv_cast} LIMIT 8",
             (uid, emb_str),
         )
     if not fact_rows:
@@ -279,6 +285,11 @@ def maybe_store_semantic_fact(user_id: str, text: str, cfg: dict[str, Any] | Non
     uid = str(user_id or "default_user")
     # Compute embedding vector (best-effort, may return [] if provider not configured)
     emb_vec: list[float] = _get_embedding_for_text(q, cfg or {}) if cfg else []
+    tvc = resolve_text_vec_config(cfg or {})
+    tv_stored = int(tvc.get("stored_dim") or 1024)
+    tv_cast = str(tvc.get("cast_sql") or "::vector")
+    if emb_vec and bool(tvc.get("matryoshka")) and len(emb_vec) > tv_stored:
+        emb_vec = emb_vec[:tv_stored]
     with psycopg.connect(dsn, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -290,7 +301,7 @@ def maybe_store_semantic_fact(user_id: str, text: str, cfg: dict[str, Any] | Non
             if emb_vec:
                 emb_str = "[" + ",".join(str(float(x)) for x in emb_vec) + "]"
                 cur.execute(
-                    "INSERT INTO semantic_memory(user_id, fact, embedding) VALUES (%s, %s, %s::vector)",
+                    f"INSERT INTO semantic_memory(user_id, fact, embedding) VALUES (%s, %s, %s{tv_cast})",
                     (uid, q, emb_str),
                 )
             else:

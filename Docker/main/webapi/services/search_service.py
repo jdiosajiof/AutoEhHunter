@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 from fastapi import HTTPException
 
-from ..core.config_values import as_bool as _as_bool
+from ..core.config_values import as_bool as _as_bool, resolve_text_vec_config
 from ..core.constants import THUMB_CACHE_DIR
 from .ai_provider import _extract_tags_by_llm, _llm_timeout_s, _provider_embedding
 from .config_service import ensure_dirs, resolve_config, _runtime_tzinfo
@@ -682,11 +682,16 @@ def _agent_nl_search(
         emb_key = str(cfg.get("LLM_API_KEY") or "").strip()
         vec = _provider_embedding(str(cfg.get("LLM_API_BASE") or ""), emb_key, emb_model, q, timeout_s=_llm_timeout_s(cfg))
         if vec:
+            tvc = resolve_text_vec_config(cfg)
+            tv_stored = int(tvc.get("stored_dim") or len(vec))
+            tv_cast = str(tvc.get("cast_sql") or "::vector")
+            if bool(tvc.get("matryoshka")) and len(vec) > tv_stored:
+                vec = vec[:tv_stored]
             vtxt = _vector_literal(vec)
             if scope in ("works", "both"):
                 rows = query_rows(
                     "SELECT w.arcid FROM works w WHERE w.desc_embedding IS NOT NULL "
-                    "ORDER BY w.desc_embedding <=> (%s)::vector LIMIT %s",
+                    f"ORDER BY w.desc_embedding <=> (%s){tv_cast} LIMIT %s",
                     (vtxt, int(max(30, limit * 2))),
                 )
                 channels["desc"] = [f"work:{str(r.get('arcid') or '').strip()}" for r in rows if str(r.get("arcid") or "").strip()]

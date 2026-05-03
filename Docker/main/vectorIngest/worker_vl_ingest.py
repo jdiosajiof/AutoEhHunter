@@ -105,6 +105,43 @@ def _load_runtime_config_from_db(dsn: str) -> dict[str, str]:
     return out
 
 
+def _resolve_text_vec_from_db(db_cfg: dict[str, str]) -> dict[str, Any]:
+    """Derive effective text vector storage config from DB app_config values.
+
+    Standalone version for the worker (avoids importing webapi packages).
+    """
+    _HNSW_MAX_VECTOR = 2000
+    _HNSW_MAX_HALFVEC = 4000
+
+    dim = max(64, int(db_cfg.get("EMB_TEXT_DIM") or 1024))
+    matryoshka = str(db_cfg.get("EMB_TEXT_MATRYOSHKA") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    storage_pref = str(db_cfg.get("EMB_TEXT_STORAGE") or "auto").strip().lower()
+    index_pref = str(db_cfg.get("EMB_TEXT_INDEX") or "hnsw").strip().lower()
+
+    def _best(d: int) -> str:
+        if d <= _HNSW_MAX_VECTOR:
+            return "vector"
+        if d <= _HNSW_MAX_HALFVEC:
+            return "halfvec"
+        return "vector"
+
+    def _max_idx(st: str) -> int:
+        return _HNSW_MAX_VECTOR if st == "vector" else (_HNSW_MAX_HALFVEC if st == "halfvec" else 0)
+
+    storage = storage_pref if storage_pref in ("vector", "halfvec", "bit") else _best(dim)
+    if storage_pref == "auto":
+        storage = _best(dim)
+
+    if matryoshka:
+        mx = _max_idx(storage)
+        stored_dim = min(dim, mx) if (index_pref != "none" and mx > 0) else dim
+    else:
+        stored_dim = dim
+
+    cast_sql = "::halfvec" if storage == "halfvec" else ("::bit" if storage == "bit" else "::vector")
+    return {"dim": dim, "stored_dim": stored_dim, "storage": storage, "cast_sql": cast_sql, "matryoshka": matryoshka}
+
+
 def _arg_present(argv: list[str], opt: str) -> bool:
     return opt in argv
 
@@ -776,6 +813,12 @@ def main(argv: list[str]) -> int:
                 "on",
             )
 
+    text_vec = _resolve_text_vec_from_db(db_cfg)
+    _tv_stored_dim = int(text_vec.get("stored_dim") or 1024)
+    _tv_cast = str(text_vec.get("cast_sql") or "::vector")
+    _tv_matryoshka = bool(text_vec.get("matryoshka"))
+    print(f"text_vec config: stored_dim={_tv_stored_dim} storage={text_vec.get('storage')} cast={_tv_cast} matryoshka={_tv_matryoshka}")
+
     auth = None
     if args.lrr_api_key_b64.strip():
         auth = args.lrr_api_key_b64.strip()
@@ -938,10 +981,12 @@ def main(argv: list[str]) -> int:
                     else:
                         raise
 
+                if _tv_matryoshka and len(semantic) > _tv_stored_dim:
+                    semantic = semantic[:_tv_stored_dim]
                 if not args.dry_run:
                     with conn.cursor() as cur:
                         cur.execute(
-                            "UPDATE works SET description = %s, desc_embedding = %s::vector WHERE arcid = %s",
+                            f"UPDATE works SET description = %s, desc_embedding = %s{_tv_cast} WHERE arcid = %s",
                             (description, _vector_literal(semantic), arcid),
                         )
                     conn.commit()

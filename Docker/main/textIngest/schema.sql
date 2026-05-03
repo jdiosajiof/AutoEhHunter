@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS works (
     description   text,
 
     -- Embeddings (pgvector)
-    desc_embedding   vector(1024),
+    desc_embedding   __TEXT_VEC_TYPE__,
     visual_embedding vector(1152),
     page_visual_embedding vector(1152),
     cover_embedding_status text NOT NULL DEFAULT 'pending',
@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS works (
 
 -- Backfill-friendly schema upgrades for existing installs
 ALTER TABLE works ADD COLUMN IF NOT EXISTS description text;
-ALTER TABLE works ADD COLUMN IF NOT EXISTS desc_embedding vector(1024);
+ALTER TABLE works ADD COLUMN IF NOT EXISTS desc_embedding __TEXT_VEC_TYPE__;
 ALTER TABLE works ADD COLUMN IF NOT EXISTS visual_embedding vector(1152);
 ALTER TABLE works ADD COLUMN IF NOT EXISTS page_visual_embedding vector(1152);
 ALTER TABLE works ADD COLUMN IF NOT EXISTS cover_embedding_status text NOT NULL DEFAULT 'pending';
@@ -67,8 +67,7 @@ CREATE INDEX IF NOT EXISTS idx_works_eh_posted ON works (eh_posted);
 CREATE INDEX IF NOT EXISTS idx_works_date_added ON works (date_added);
 CREATE INDEX IF NOT EXISTS idx_works_cover_status ON works (cover_embedding_status);
 
--- Vector search indexes (HNSW)
-CREATE INDEX IF NOT EXISTS idx_works_desc_vec ON works USING hnsw (desc_embedding vector_cosine_ops);
+-- Visual vector search indexes (HNSW) — fixed dimension, always vector_cosine_ops
 CREATE INDEX IF NOT EXISTS idx_works_visual_vec ON works USING hnsw (visual_embedding vector_cosine_ops);
 CREATE INDEX IF NOT EXISTS idx_works_page_visual_vec ON works USING hnsw (page_visual_embedding vector_cosine_ops);
 
@@ -236,17 +235,16 @@ CREATE TABLE IF NOT EXISTS semantic_memory (
     id           bigserial PRIMARY KEY,
     user_id      text NOT NULL DEFAULT 'default_user',
     fact         text NOT NULL,
-    embedding    vector(1024),
+    embedding    __TEXT_VEC_TYPE__,
     created_at   timestamptz NOT NULL DEFAULT now()
 );
 
 ALTER TABLE semantic_memory ADD COLUMN IF NOT EXISTS user_id text NOT NULL DEFAULT 'default_user';
 ALTER TABLE semantic_memory ADD COLUMN IF NOT EXISTS fact text;
-ALTER TABLE semantic_memory ADD COLUMN IF NOT EXISTS embedding vector(1024);
+ALTER TABLE semantic_memory ADD COLUMN IF NOT EXISTS embedding __TEXT_VEC_TYPE__;
 ALTER TABLE semantic_memory ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now();
 
 CREATE INDEX IF NOT EXISTS idx_semantic_memory_user_created ON semantic_memory (user_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_semantic_memory_vec ON semantic_memory USING hnsw (embedding vector_cosine_ops);
 
 -- User interactions for recommendation feedback (click/read/dislike).
 CREATE TABLE IF NOT EXISTS user_interactions (
@@ -297,5 +295,14 @@ ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS base_vector vector(1024);
 ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS updated_at timestamptz NOT NULL DEFAULT now();
 
 CREATE INDEX IF NOT EXISTS idx_user_profiles_updated_at ON user_profiles (updated_at);
+
+-- Migrate text-embedding columns when configured type/dim differs from current.
+-- TEXT_VEC_MIGRATE placeholder is replaced at runtime; if no migration needed
+-- the placeholder is replaced with an empty string.
+__TEXT_VEC_MIGRATE__
+
+-- Text-embedding vector indexes — created AFTER migration so ops class matches column type
+__IDX_WORKS_DESC_VEC__
+__IDX_SEMANTIC_MEMORY_VEC__
 
 COMMIT;
