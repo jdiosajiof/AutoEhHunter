@@ -127,6 +127,11 @@ CONFIG_SPECS: dict[str, dict[str, Any]] = {
     "INGEST_EMB_MODEL_CUSTOM": {"type": "text", "default": ""},
     "LLM_MODEL_CUSTOM": {"type": "text", "default": ""},
     "EMB_MODEL_CUSTOM": {"type": "text", "default": ""},
+    # ── Text embedding vector storage ────────────────────────────────────────
+    "EMB_TEXT_DIM": {"type": "int", "default": 1024, "min": 64, "max": 16000},
+    "EMB_TEXT_MATRYOSHKA": {"type": "bool", "default": False},
+    "EMB_TEXT_STORAGE": {"type": "text", "default": "auto"},
+    "EMB_TEXT_INDEX": {"type": "text", "default": "hnsw"},
     "SIGLIP_MODEL": {"type": "text", "default": "google/siglip-so400m-patch14-384"},
     "SIGLIP_WORKER_ENABLED": {"type": "bool", "default": True},
     "SIGLIP_DEVICE": {"type": "text", "default": "cpu"},

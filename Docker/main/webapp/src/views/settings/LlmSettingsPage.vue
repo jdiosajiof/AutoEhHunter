@@ -32,6 +32,25 @@
       </v-row>
     </v-card>
 
+    <!-- Embedding Vector Storage -->
+    <v-card class="pa-4 mb-4">
+      <div class="text-subtitle-1 font-weight-medium mb-3">{{ t('settings.provider.emb_text_dim') }}</div>
+      <v-row>
+        <v-col cols="12" md="3">
+          <v-text-field v-model.number="config.EMB_TEXT_DIM" :label="t('settings.provider.emb_text_dim')" :hint="t('settings.provider.emb_text_dim_hint')" type="number" min="64" max="16000" persistent-hint variant="outlined" density="compact" color="primary" />
+        </v-col>
+        <v-col cols="12" md="3">
+          <v-checkbox v-model="config.EMB_TEXT_MATRYOSHKA" :label="t('settings.provider.emb_text_matryoshka')" :hint="t('settings.provider.emb_text_matryoshka_hint')" color="primary" persistent-hint />
+        </v-col>
+        <v-col cols="12" md="3">
+          <v-select v-model="config.EMB_TEXT_STORAGE" :items="embStorageOptionsSettings" item-title="title" item-value="value" :label="t('settings.provider.emb_text_storage')" :hint="t('settings.provider.emb_text_storage_hint')" persistent-hint variant="outlined" density="compact" color="primary" />
+        </v-col>
+        <v-col cols="12" md="3">
+          <v-select v-model="config.EMB_TEXT_INDEX" :items="embIndexOptionsSettings" item-title="title" item-value="value" :label="t('settings.provider.emb_text_index')" :hint="t('settings.provider.emb_text_index_hint')" persistent-hint variant="outlined" density="compact" color="primary" />
+        </v-col>
+      </v-row>
+    </v-card>
+
     <!-- Prompts -->
     <v-card class="pa-4 mb-4">
       <div class="text-subtitle-1 font-weight-medium mb-3">{{ t('settings.section.prompts') }}</div>
@@ -153,14 +172,31 @@
 </template>
 
 <script>
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import { useSettingsStore } from "../../stores/settingsStore";
 
 export default {
   setup() {
+    const store = useSettingsStore();
+    const embStorageOptionsSettings = computed(() => {
+      const dim = Number(store.config.EMB_TEXT_DIM) || 1024;
+      const mat = store.config.EMB_TEXT_MATRYOSHKA;
+      const opts = [{ value: "auto", title: "auto" }];
+      if (dim <= 2000 || mat) opts.push({ value: "vector", title: "vector (float32)" });
+      if (dim <= 4000 || mat) opts.push({ value: "halfvec", title: "halfvec (float16)" });
+      opts.push({ value: "bit", title: "bit (binary)" });
+      return opts;
+    });
+    const embIndexOptionsSettings = [
+      { value: "hnsw", title: "HNSW (default)" },
+      { value: "ivfflat", title: "IVFFlat" },
+      { value: "none", title: "None (seq scan)" },
+    ];
     return {
-      ...useSettingsStore(),
+      ...store,
       settingsLocked: ref(true),
+      embStorageOptionsSettings,
+      embIndexOptionsSettings,
     };
   },
 };

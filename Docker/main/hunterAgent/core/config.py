@@ -157,6 +157,27 @@ class Settings:
     prompt_report_system: str
     prompt_tag_extract_system: str
 
+    # Text embedding vector storage
+    emb_text_dim: int = 1024
+    emb_text_stored_dim: int = 1024
+    emb_text_cast_sql: str = "::vector"
+    emb_text_matryoshka: bool = False
+
+
+def _resolve_text_vec_settings(db_cfg: dict[str, str]) -> tuple[int, int, str, bool]:
+    """Return (dim, stored_dim, cast_sql, matryoshka) from DB config values."""
+    _HNSW_VEC = 2000
+    _HNSW_HV = 4000
+    dim = max(64, int(db_cfg.get("EMB_TEXT_DIM") or 1024))
+    mat = str(db_cfg.get("EMB_TEXT_MATRYOSHKA") or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    sp = str(db_cfg.get("EMB_TEXT_STORAGE") or "auto").strip().lower()
+    idx = str(db_cfg.get("EMB_TEXT_INDEX") or "hnsw").strip().lower()
+    storage = sp if sp in ("vector", "halfvec", "bit") else ("vector" if dim <= _HNSW_VEC else ("halfvec" if dim <= _HNSW_HV else "vector"))
+    mx = _HNSW_VEC if storage == "vector" else (_HNSW_HV if storage == "halfvec" else 0)
+    stored = min(dim, mx) if (mat and idx != "none" and mx > 0) else dim
+    cast = "::halfvec" if storage == "halfvec" else ("::bit" if storage == "bit" else "::vector")
+    return dim, stored, cast, mat
+
 
 def get_settings() -> Settings:
     dsn = os.getenv("POSTGRES_DSN", "").strip()
@@ -185,6 +206,8 @@ def get_settings() -> Settings:
             return float(raw)
         except Exception:
             return float(default)
+
+    tv_dim, tv_stored, tv_cast, tv_mat = _resolve_text_vec_settings(db_cfg)
 
     return Settings(
         postgres_dsn=dsn,
@@ -215,4 +238,8 @@ def get_settings() -> Settings:
         prompt_profile_system=_cfg("PROMPT_PROFILE_SYSTEM", "").strip(),
         prompt_report_system=_cfg("PROMPT_REPORT_SYSTEM", "").strip(),
         prompt_tag_extract_system=_cfg("PROMPT_TAG_EXTRACT_SYSTEM", "").strip(),
+        emb_text_dim=tv_dim,
+        emb_text_stored_dim=tv_stored,
+        emb_text_cast_sql=tv_cast,
+        emb_text_matryoshka=tv_mat,
     )

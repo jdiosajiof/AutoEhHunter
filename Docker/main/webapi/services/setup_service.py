@@ -6,6 +6,7 @@ from pathlib import Path
 import psycopg
 import requests
 
+from ..core.config_values import resolve_text_vec_config
 from .auth_service import build_dsn
 
 
@@ -42,7 +43,65 @@ def validate_lrr(base: str, api_key: str, timeout_s: int = 8) -> tuple[bool, str
         return False, str(e)
 
 
-def init_core_schema(dsn: str, schema_path: str = "") -> tuple[bool, str]:
+def _build_text_vec_index_sql(index_name: str, table: str, column: str, vc: dict[str, Any]) -> str:
+    idx = str(vc.get("index") or "none")
+    ops = str(vc.get("ops_sql") or "vector_cosine_ops")
+    if idx == "none":
+        return f"-- index {index_name} skipped (EMB_TEXT_INDEX=none)"
+    return f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} USING {idx} ({column} {ops});"
+
+
+def _build_migration_sql(vc: dict[str, Any]) -> str:
+    type_sql = str(vc.get("type_sql") or "vector(1024)")
+    storage = str(vc.get("storage") or "vector")
+    stored_dim = int(vc.get("stored_dim") or 1024)
+    target_typname = storage if storage in ("vector", "halfvec", "bit") else "vector"
+    _COL_INDEX = {
+        ("works", "desc_embedding"): "idx_works_desc_vec",
+        ("semantic_memory", "embedding"): "idx_semantic_memory_vec",
+    }
+    parts: list[str] = []
+    for (table, column), idx_name in _COL_INDEX.items():
+        parts.append(f"""
+DO $$
+DECLARE
+    cur_typname text;
+    cur_typmod  int;
+BEGIN
+    SELECT t.typname, a.atttypmod INTO cur_typname, cur_typmod
+    FROM pg_attribute a
+    JOIN pg_type t ON t.oid = a.atttypid
+    WHERE a.attrelid = '{table}'::regclass AND a.attname = '{column}';
+    IF cur_typname IS NOT NULL AND (cur_typname <> '{target_typname}' OR cur_typmod <> {stored_dim}) THEN
+        EXECUTE 'DROP INDEX IF EXISTS {idx_name}';
+        EXECUTE 'ALTER TABLE {table} ALTER COLUMN {column} TYPE {type_sql} USING NULL';
+        RAISE NOTICE 'Migrated {table}.{column} from %(%) to {type_sql}', cur_typname, cur_typmod;
+    END IF;
+END $$;""")
+    return "\n".join(parts)
+
+
+def _substitute_schema_sql(sql: str, cfg: dict[str, Any]) -> str:
+    vc = resolve_text_vec_config(cfg)
+    type_sql = str(vc.get("type_sql") or "vector(1024)")
+
+    sql = sql.replace("__TEXT_VEC_TYPE__", type_sql)
+
+    sql = sql.replace(
+        "__IDX_WORKS_DESC_VEC__",
+        _build_text_vec_index_sql("idx_works_desc_vec", "works", "desc_embedding", vc),
+    )
+    sql = sql.replace(
+        "__IDX_SEMANTIC_MEMORY_VEC__",
+        _build_text_vec_index_sql("idx_semantic_memory_vec", "semantic_memory", "embedding", vc),
+    )
+
+    sql = sql.replace("__TEXT_VEC_MIGRATE__", _build_migration_sql(vc))
+
+    return sql
+
+
+def init_core_schema(dsn: str, schema_path: str = "", cfg: dict[str, Any] | None = None) -> tuple[bool, str]:
     s = str(dsn or "").strip()
     if not s:
         return False, "missing dsn"
@@ -63,6 +122,14 @@ def init_core_schema(dsn: str, schema_path: str = "") -> tuple[bool, str]:
 
     try:
         sql = schema_file.read_text(encoding="utf-8")
+        effective_cfg = cfg or {}
+        if not effective_cfg:
+            try:
+                from .config_service import resolve_config
+                effective_cfg, _ = resolve_config()
+            except Exception:
+                pass
+        sql = _substitute_schema_sql(sql, effective_cfg)
         with psycopg.connect(s, connect_timeout=15) as conn:
             conn.execute("SET statement_timeout = '5min'")
             with conn.cursor() as cur:

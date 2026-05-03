@@ -149,11 +149,17 @@ def setup_complete() -> dict[str, Any]:
     dsn = db_dsn()
     if not dsn:
         raise HTTPException(status_code=503, detail="database is not configured")
+
+    cfg, _ = resolve_config()
+    try:
+        init_core_schema(dsn, cfg=cfg)
+    except Exception:
+        pass
+
     set_initialized(dsn, True)
 
     codes = generate_recovery_codes(10)
     hashed = hash_recovery_codes(codes)
-    cfg, _ = resolve_config()
     to_save = dict(cfg)
     to_save["DATA_UI_RECOVERY_CODES"] = ",".join(hashed)
     _save_json_config(to_save)
@@ -284,6 +290,17 @@ def update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
     new_cfg["POSTGRES_DSN"] = _build_dsn(new_cfg)
     _save_json_config(new_cfg)
     ok_db, db_err = _save_db_config(new_cfg.get("POSTGRES_DSN", ""), new_cfg)
+    emb_vec_changed = any(
+        str(new_cfg.get(k, "")) != str(cfg.get(k, ""))
+        for k in ("EMB_TEXT_DIM", "EMB_TEXT_MATRYOSHKA", "EMB_TEXT_STORAGE", "EMB_TEXT_INDEX")
+    )
+    schema_note = ""
+    if emb_vec_changed and new_cfg.get("POSTGRES_DSN"):
+        try:
+            s_ok, s_msg = init_core_schema(new_cfg["POSTGRES_DSN"], cfg=new_cfg)
+            schema_note = f"schema: {s_msg}" if not s_ok else "schema updated"
+        except Exception as e:
+            schema_note = f"schema error: {e}"
     try:
         if bool(new_cfg.get("SIGLIP_WORKER_ENABLED", True)):
             enable_eh_cover_embedding_worker()
@@ -293,7 +310,7 @@ def update_config(req: ConfigUpdateRequest) -> dict[str, Any]:
         pass
     apply_runtime_timezone()
     sync_scheduler()
-    return {"ok": True, "saved_json": True, "saved_db": ok_db, "db_error": db_err}
+    return {"ok": True, "saved_json": True, "saved_db": ok_db, "db_error": db_err, "schema_note": schema_note}
 
 
 @router.get("/api/config/app-config/download")

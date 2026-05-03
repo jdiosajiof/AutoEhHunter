@@ -151,6 +151,27 @@
             <v-col cols="12" md="6"><v-text-field v-model="setupForm.INGEST_VL_MODEL_CUSTOM" :label="t('settings.provider.ingest_vl_model_custom')" /></v-col>
             <v-col cols="12" md="6"><v-text-field v-model="setupForm.INGEST_EMB_MODEL_CUSTOM" :label="t('settings.provider.ingest_emb_model_custom')" /></v-col>
           </v-row>
+          <v-divider class="my-4" />
+          <div class="text-subtitle-2 font-weight-medium mb-2">{{ t('settings.provider.emb_text_dim') }}</div>
+          <v-row>
+            <v-col cols="12" md="3">
+              <v-text-field v-model.number="setupForm.EMB_TEXT_DIM" :label="t('settings.provider.emb_text_dim')" :hint="t('settings.provider.emb_text_dim_hint')" type="number" min="64" max="16000" persistent-hint />
+            </v-col>
+            <v-col cols="12" md="3">
+              <v-checkbox v-model="setupForm.EMB_TEXT_MATRYOSHKA" :label="t('settings.provider.emb_text_matryoshka')" :hint="t('settings.provider.emb_text_matryoshka_hint')" color="primary" persistent-hint />
+            </v-col>
+            <v-col cols="12" md="3">
+              <v-select v-model="setupForm.EMB_TEXT_STORAGE" :items="embStorageOptions" item-title="title" item-value="value" :label="t('settings.provider.emb_text_storage')" :hint="t('settings.provider.emb_text_storage_hint')" persistent-hint />
+            </v-col>
+            <v-col cols="12" md="3">
+              <v-select v-model="setupForm.EMB_TEXT_INDEX" :items="embIndexOptions" item-title="title" item-value="value" :label="t('settings.provider.emb_text_index')" :hint="t('settings.provider.emb_text_index_hint')" persistent-hint />
+            </v-col>
+            <v-col cols="12">
+              <v-alert type="info" variant="tonal" density="compact">
+                {{ t('settings.provider.emb_text_effective').replace('{type}', embEffective.type).replace('{dim}', String(embEffective.dim)).replace('{index}', embEffective.index) }}
+              </v-alert>
+            </v-col>
+          </v-row>
         </v-window-item>
 
         <v-window-item :value="7">
@@ -333,6 +354,50 @@ const setupForm = reactive({
   EMB_MODEL: "",
   LLM_MODEL_CUSTOM: "",
   EMB_MODEL_CUSTOM: "",
+  EMB_TEXT_DIM: 1024,
+  EMB_TEXT_MATRYOSHKA: false,
+  EMB_TEXT_STORAGE: "auto",
+  EMB_TEXT_INDEX: "hnsw",
+});
+
+const HNSW_MAX_VEC = 2000;
+const HNSW_MAX_HV = 4000;
+
+const embStorageOptions = computed(() => {
+  const dim = Number(setupForm.EMB_TEXT_DIM) || 1024;
+  const mat = !!setupForm.EMB_TEXT_MATRYOSHKA;
+  const opts = [{ value: "auto", title: "auto" }];
+  if (dim <= HNSW_MAX_VEC || mat) opts.push({ value: "vector", title: "vector (float32)" });
+  if (dim <= HNSW_MAX_HV || mat) opts.push({ value: "halfvec", title: "halfvec (float16)" });
+  opts.push({ value: "bit", title: "bit (binary)" });
+  return opts;
+});
+const embIndexOptions = [
+  { value: "hnsw", title: "HNSW (default)" },
+  { value: "ivfflat", title: "IVFFlat" },
+  { value: "none", title: "None (seq scan)" },
+];
+
+const embEffective = computed(() => {
+  const dim = Number(setupForm.EMB_TEXT_DIM) || 1024;
+  const mat = !!setupForm.EMB_TEXT_MATRYOSHKA;
+  let st = String(setupForm.EMB_TEXT_STORAGE || "auto").toLowerCase();
+  let idx = String(setupForm.EMB_TEXT_INDEX || "hnsw").toLowerCase();
+  if (st === "auto") st = dim <= HNSW_MAX_VEC ? "vector" : (dim <= HNSW_MAX_HV ? "halfvec" : "vector");
+  const maxIdx = st === "vector" ? HNSW_MAX_VEC : (st === "halfvec" ? HNSW_MAX_HV : 0);
+  let stored = dim;
+  if (mat && idx !== "none" && maxIdx > 0) stored = Math.min(dim, maxIdx);
+  if (idx !== "none" && stored > maxIdx) idx = "none";
+  const typeLabel = st === "halfvec" ? `halfvec(${stored})` : (st === "bit" ? `bit(${stored})` : `vector(${stored})`);
+  return { type: typeLabel, dim: stored, index: idx };
+});
+
+watch(() => setupForm.EMB_TEXT_DIM, () => {
+  const dim = Number(setupForm.EMB_TEXT_DIM) || 1024;
+  const mat = !!setupForm.EMB_TEXT_MATRYOSHKA;
+  if (setupForm.EMB_TEXT_STORAGE === "auto") return;
+  if (setupForm.EMB_TEXT_STORAGE === "vector" && dim > HNSW_MAX_VEC && !mat) setupForm.EMB_TEXT_STORAGE = "auto";
+  if (setupForm.EMB_TEXT_STORAGE === "halfvec" && dim > HNSW_MAX_HV && !mat) setupForm.EMB_TEXT_STORAGE = "auto";
 });
 
 const siglipDownloading = computed(() => settings.siglipDownload.status && settings.siglipDownload.status !== "done");
@@ -530,6 +595,10 @@ watch(
       EMB_MODEL: settings.config.EMB_MODEL || "",
       LLM_MODEL_CUSTOM: settings.config.LLM_MODEL_CUSTOM || "",
       EMB_MODEL_CUSTOM: settings.config.EMB_MODEL_CUSTOM || "",
+      EMB_TEXT_DIM: Number(settings.config.EMB_TEXT_DIM || 1024),
+      EMB_TEXT_MATRYOSHKA: !!settings.config.EMB_TEXT_MATRYOSHKA,
+      EMB_TEXT_STORAGE: settings.config.EMB_TEXT_STORAGE || "auto",
+      EMB_TEXT_INDEX: settings.config.EMB_TEXT_INDEX || "hnsw",
     });
     ehCookieParts.value = parseCookie(setupForm.EH_COOKIE || "");
     const blocked = new Set(String(setupForm.EH_FILTER_CATEGORY || "").split(",").map((x) => String(x || "").trim().toLowerCase()).filter(Boolean));

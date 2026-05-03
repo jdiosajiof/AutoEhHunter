@@ -276,14 +276,18 @@ def search_by_desc_vector(
 ) -> List[str]:
     if not query_vec:
         return []
+    tv_cast = str(getattr(settings, "emb_text_cast_sql", "::vector") or "::vector")
+    tv_stored = int(getattr(settings, "emb_text_stored_dim", 0) or 0)
+    tv_mat = bool(getattr(settings, "emb_text_matryoshka", False))
+    if tv_mat and tv_stored > 0 and len(query_vec) > tv_stored:
+        query_vec = query_vec[:tv_stored]
     v = _vector_literal(query_vec)
     where = "desc_embedding IS NOT NULL"
     params: List[Any] = []
     if tags:
         where += " AND tags && %s"
         params.append(list(tags))
-    # Use cosine distance (<=>) to be robust even if desc embeddings are not normalized.
-    sql = f"SELECT arcid FROM works WHERE {where} ORDER BY desc_embedding <=> (%s)::vector LIMIT %s"
+    sql = f"SELECT arcid FROM works WHERE {where} ORDER BY desc_embedding <=> (%s){tv_cast} LIMIT %s"
     params.extend([v, int(limit)])
 
     conn = get_db_connection(settings)
